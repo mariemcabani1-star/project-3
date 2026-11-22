@@ -87,7 +87,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(r["error"]["code"], "range_too_large")
 
     # --- write tool ---
-    def test_create_event_writes_and_invites(self):
+    def test_create_event_writes_and_queues_invites(self):
         r = call("create_event", **new_event())
         self.assertTrue(r["created"])
         s = store.load()
@@ -180,6 +180,15 @@ class ToolTests(unittest.TestCase):
             rec = json.loads(f.readlines()[-1])
         self.assertEqual(rec["tool"], "get_calendar")
         self.assertIn("duration_ms", rec)
+
+    def test_write_precheck_attempts_are_logged(self):
+        error = precheck("create_event", {"title": "Missing required details"})
+        self.assertIsNotNone(error)
+        with open(os.environ["TOOL_LOG_PATH"]) as f:
+            rec = json.loads(f.readlines()[-1])
+        self.assertEqual(rec["tool"], "create_event")
+        self.assertEqual(rec["phase"], "precheck")
+        self.assertEqual(rec["output"]["error"]["code"], "bad_arguments")
 
 
 if __name__ == "__main__":

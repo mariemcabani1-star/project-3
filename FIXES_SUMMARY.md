@@ -1,64 +1,73 @@
-# Calendar sandbox and LangGraph fixes
+# Bounded LangGraph agent and sandbox evaluation
 
 ```text
-feat: enforce sandboxed LangGraph calendar writes
+feat: add bounded OpenAI tool loop to LangGraph calendar agent
 
-- Route calendar creation through the isolated JSON sandbox, not Google Calendar.
-- Require a one-use registry grant bound to the exact operation approved in LangGraph.
-- Keep the thread ID as the request ID for idempotent creation.
-- Preserve descriptions and separate application validation from sandbox limits.
-- Reset a disposable seed calendar before evaluation and test the approval gates.
-- Preserve the yes/no/edit flow, including re-approval after edits.
+- Use LangGraph to orchestrate an OpenAI gpt-4o-mini model/read/observe loop.
+- Separate offline scripted evaluation from explicitly selected live mode.
+- Enforce model-turn, tool-call, runtime, completion-token, and preflight cost limits.
+- Require a successful calendar read and explicit human approval before event writes.
+- Keep event creation isolated to the seeded JSON sandbox with request-scoped idempotency.
+- Add 36 offline trajectory scenarios covering normal use, approvals, injection, errors, recovery, and limits.
+- Record per-scenario trajectories, approvals, synthetic token usage, estimated cost, and pass/fail.
 ```
 
-## Implementation details
+## Implementation
 
-- The CLI now displays the approval `proposal` payload.
-- The CLI creates one `thread_id`, uses it in the initial state as `request_id`,
-  and resumes interruptions with `Command(resume=...)`.
-- Edited events return to the approval checkpoint before they can be created.
-- The graph executes the exact operation presented for approval.
-- Descriptions are retained in the proposed operation and sandbox event.
-- The adapter prepares sandbox operations; the registry rejects direct writes
-  and accepts a one-use grant bound to the exact operation after graph approval.
-- The active LangGraph workflow does not import or call Google Calendar.
+- `main.py --mode live` is the only CLI path that loads `.env` or constructs the
+  OpenAI client. It explicitly prioritizes project `.env` values over inherited
+  shell variables and handles LangGraph approval/edit interrupts.
+- `agent/graph.py` owns the model → tool → observation loop and routes every
+  `create_event` proposal through the approval checkpoint.
+- `agent/model.py` provides the OpenAI Chat Completions client and an injectable
+  model protocol. The OpenAI SDK is imported only when the live client is called.
+- `agent/config.py` supplies the default limits and requires configured model
+  pricing before live requests can run.
+- `agent/nodes.py` records model/tool observations, enforces bounded execution,
+  checks reads before writes, and issues a one-use grant only after approval.
+- Before each live request, the graph reserves a conservative input-token
+  ceiling and caps output tokens using the configured per-million-token prices;
+  after the request, it records actual provider-reported usage.
+- Live mode fixes the model to `gpt-4o-mini` and caps per-request spending at
+  `$0.10`; that cost ceiling cannot be raised through `.env`.
+- `python main.py --mode live` is the live command. The offline commands are
+  `python -m tests.run_evaluation` and `python -m tests.run_scenarios`; they need
+  no OpenAI key or credits and do not load `.env`.
+- `agent/tools/` keeps read execution in the registry and rejects direct writes.
+- `tests/scenarios.py` defines exactly 36 offline scripted scenarios.
+  `tests/run_scenarios.py` records calls, observations, expected and actual
+  trajectories, approvals, final results, synthetic token use, estimated costs,
+  and pass/fail in `evaluation/results.json`.
 
 ## Verification
 
-- `python -m tests.run_evaluation` passed (30 tests) using a disposable,
-  seed-reset sandbox.
-- An approved CLI event was created in a disposable sandbox; the event and
-  invitation outbox entry were verified.
+Run the unit suite and offline trajectories with:
 
-## Next implementation step (not implemented yet)
+```powershell
+python -m tests.run_evaluation
+python -m tests.run_scenarios
+```
 
-Add a non-breaking **Find available time** path to the existing LangGraph CLI:
+Verified with the OpenAI SDK import-blocked and no API key set: 41 tests passed,
+and all 36 scenarios passed. The detailed scenario records are in
+`evaluation/results.json`.
 
-1. Collect a date range and meeting duration from the user.
-2. Add a read-only graph node that calls `get_calendar` and
-   `find_free_slots` through the sandbox registry.
-3. Present available slots and let the user choose one before collecting the
-   remaining event details.
-4. Route the chosen slot through the existing proposal and approval nodes.
-   The write must still require explicit approval and execute the exact
-   approved operation.
-5. Add tests for available slots, no available slots, conflicts, and approval
-   and rejection. Confirm read-only nodes never call `create_event`.
+The offline scenarios do not make OpenAI or Google API calls. Their token use
+and estimated cost are synthetic; their injection cases verify the graph and
+approval boundary, not the live model's ability to resist every attack.
 
-Keep the current direct-time event flow available. Keep invitations sandboxed
-in the JSON outbox; real Google Calendar writes or invitation sending are out
-of scope for this step.
+## Remaining limitations and next step
 
-## Remaining scope and limitations
+- Calendar writes remain sandbox-only. Invitations are queued in the JSON
+  outbox; no Google Calendar write or real invitation is sent.
+- The cost cap is based on token estimates and provider-reported usage, not a
+  provider-guaranteed maximum bill.
+- The last live request returned OpenAI `429: You have no credits remaining`.
+  This is an account/project billing issue, not a LangGraph or sandbox failure.
+- Live model behavior has not been validated because the active OpenAI billing
+  project has no credits. The offline evaluation remains runnable without them.
 
-- The graph does not yet call `get_calendar` or `find_free_slots`; it creates a
-  user-proposed event rather than searching for an available time.
-- Sandbox invitations are queued in the JSON outbox; no real invitations are
-  sent, and there is no separate `update_event` tool.
-- The registry rejects direct write calls. Any future write tool still needs a
-  graph approval route that issues a grant for its exact approved operation.
-- `tests/test_create_event.py` is empty. The root-level Google and LangSmith
-  scripts are separate manual checks; they are not part of the documented
-  unittest command.
-- The `feat/langgraph-sandbox` branch currently has no commits; commit the
-  reviewed project files before pushing.
+An OpenAI live smoke test is optional for the offline evaluation and requires
+credits. When available, use a disposable JSON sandbox and current model prices
+to verify a read-only request, approved creation, rejection, and edit/re-approval.
+Do not enable the Google integration for that test.

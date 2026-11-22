@@ -12,8 +12,10 @@ import json
 import os
 import time
 import traceback
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .base import Tool, ToolError
 from .calendar_tools import CREATE_EVENT, FIND_FREE_SLOTS, GET_CALENDAR
@@ -50,7 +52,27 @@ def log_path() -> Path:
 
 
 def openai_specs() -> list[dict]:
-    return [t.openai_spec() for t in ALL_TOOLS]
+    specs = deepcopy([t.openai_spec() for t in ALL_TOOLS])
+    for spec in specs:
+        _strip_model_schema_hints(spec["function"]["parameters"])
+        if spec["function"]["name"] == "create_event":
+            parameters = spec["function"]["parameters"]
+            parameters["properties"].pop("idempotency_key")
+            parameters["required"] = [
+                field for field in parameters["required"]
+                if field != "idempotency_key"
+            ]
+    return specs
+
+
+def _strip_model_schema_hints(value: Any) -> None:
+    if isinstance(value, dict):
+        value.pop("x-format-hint", None)
+        for nested in value.values():
+            _strip_model_schema_hints(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _strip_model_schema_hints(nested)
 
 
 def needs_approval(name: str) -> bool:
@@ -151,9 +173,15 @@ def _execute(name: str, raw_args, approval: _WriteApproval | None = None) -> str
     return out
 
 
-def _log(name, args, result, t0) -> None:
-    rec = {"ts": datetime.now(timezone.utc).isoformat(), "tool": name, "input": args,
-           "output": result, "duration_ms": round((time.perf_counter() - t0) * 1000, 2)}
+def _log(name, args, result, t0, phase: str = "execute") -> None:
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "tool": name,
+        "phase": phase,
+        "input": args,
+        "output": result,
+        "duration_ms": round((time.perf_counter() - t0) * 1000, 2),
+    }
     p = log_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
@@ -166,6 +194,8 @@ def precheck(name: str, raw_args) -> str | None:
     The loop uses this so a human is never asked to approve a write that would be
     rejected anyway.
     """
+    t0 = time.perf_counter()
+    args: object = raw_args
     try:
         tool = TOOLS.get(name)
         if tool is None:
@@ -177,7 +207,19 @@ def precheck(name: str, raw_args) -> str | None:
             raise ToolError("bad_arguments", "; ".join(problems),
                             "Fix the arguments and call the tool again.")
     except ToolError as e:
-        return json.dumps({"ok": False, "error": {"code": e.code, "message": e.message, "hint": e.hint}})
+        result = {
+            "ok": False,
+            "error": {"code": e.code, "message": e.message, "hint": e.hint},
+        }
+        _log(name, args, result, t0, phase="precheck")
+        return json.dumps(result)
+    _log(
+        name,
+        args,
+        {"ok": True, "validated_only": True},
+        t0,
+        phase="precheck",
+    )
     return None
 
 

@@ -1,31 +1,89 @@
-import json
+from __future__ import annotations
+
+import os
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from langgraph.types import Command
 
 import main
+from agent.config import AgentSettings
 from agent.graph import build_graph
+from agent.model import ModelResponse
 from agent.sandbox_adapter import prepare_sandbox_event
+from agent.tools.calendar_tools import CREATE_EVENT
+from agent.tools.registry import openai_specs
+from sandbox import store
 from schemas.event_schema import EventPayload
+from tests.agent_fakes import ScriptedModel, final_step, tool_step
 
 
-def event(title="Project meeting", description="Planning"):
-    return EventPayload(
-        title=title,
-        start_time="2026-12-03T14:00:00+01:00",
-        end_time="2026-12-03T15:00:00+01:00",
-        attendees=["sam@example.com"],
-        description=description,
-    ).model_dump(mode="json")
+def create_args(title: str = "Project meeting") -> dict:
+    return {
+        "title": title,
+        "start": "2026-12-07T14:00",
+        "end": "2026-12-07T14:30",
+        "attendees": ["sam@example.com"],
+        "description": "Planning",
+    }
 
 
-def interrupted_request(result):
-    return result["__interrupt__"][0].value
+def initial_state(request_id: str = "workflow-test") -> dict:
+    from agent.nodes import SYSTEM_PROMPT
 
+    return {
+        "request_id": request_id,
+        "user_request": "Create a project meeting.",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "Create a project meeting."},
+        ],
+        "pending_tool_call": None,
+        "approved_tool_call": None,
+        "approval": "pending",
+        "approval_decisions": [],
+        "successful_reads": 0,
+        "model_turns": 0,
+        "tool_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "started_at": time.monotonic(),
+        "trajectory": [{"type": "user_request", "text": "Create a project meeting."}],
+        "status": "running",
+    }
 
 class WorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="calendar-agent-workflow-tests-"
+        )
+        cls._previous_environment = {
+            key: os.environ.get(key)
+            for key in ("CALENDAR_SANDBOX_DIR", "TOOL_LOG_PATH")
+        }
+        os.environ["CALENDAR_SANDBOX_DIR"] = cls._temporary_directory.name
+        os.environ["TOOL_LOG_PATH"] = str(
+            Path(cls._temporary_directory.name) / "tool_calls.jsonl"
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        for key, value in cls._previous_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        cls._temporary_directory.cleanup()
+
+    def setUp(self):
+        store.reset()
+
     def test_cli_uses_thread_id_as_request_id_and_resumes_approval(self):
         class FakeGraph:
             def __init__(self):
@@ -38,7 +96,12 @@ class WorkflowTests(unittest.TestCase):
                         "__interrupt__": [
                             SimpleNamespace(value={
                                 "type": "approval",
-                                "proposal": event(),
+                                "proposal": {
+                                    "title": "Project meeting",
+                                    "start_time": "2026-12-07T14:00",
+                                    "end_time": "2026-12-07T14:30",
+                                    "attendees": ["sam@example.com"],
+                                },
                             })
                         ]
                     }
@@ -47,97 +110,301 @@ class WorkflowTests(unittest.TestCase):
         graph = FakeGraph()
         with (
             patch("main.build_graph", return_value=graph),
-            patch("builtins.input", return_value="yes"),
-            patch("main.display_event"),
+            patch("builtins.input", return_value="1"),
+            patch("main.display_proposal"),
         ):
-            main.run_workflow(event())
+            main.run_workflow(
+                "Create a project meeting.",
+                model_client=ScriptedModel([]),
+            )
 
-        initial_state, config = graph.calls[0]
+        state, config = graph.calls[0]
         self.assertEqual(
-            initial_state["request_id"],
+            state["request_id"],
             config["configurable"]["thread_id"],
+        )
+        self.assertEqual(
+            state["messages"][-1],
+            {"role": "user", "content": "Create a project meeting."},
         )
         resume_command, resumed_config = graph.calls[1]
         self.assertIsInstance(resume_command, Command)
-        self.assertEqual(resume_command.resume, "yes")
+        self.assertEqual(resume_command.resume, {"decision": "yes"})
         self.assertEqual(resumed_config, config)
 
-    def test_edit_requires_reapproval_and_creates_exact_approved_proposal(self):
-        graph = build_graph()
-        config = {"configurable": {"thread_id": "workflow-test"}}
-        result = graph.invoke(
-            {
-                "event": event(),
-                "approval": "pending",
-                "request_id": "workflow-test",
-            },
-            config=config,
-        )
-        self.assertEqual(interrupted_request(result)["proposal"]["description"], "Planning")
+    def test_live_cli_requires_explicit_mode_and_uses_dotenv_values(self):
+        with patch("sys.argv", ["main.py"]):
+            with self.assertRaises(SystemExit):
+                main.main()
 
-        result = graph.invoke(Command(resume="edit"), config=config)
-        edit_request = interrupted_request(result)
+        with (
+            patch("sys.argv", ["main.py", "--mode", "live"]),
+            patch("main.load_dotenv") as load_dotenv,
+            patch("main.collect_user_request", return_value="Find a meeting time."),
+            patch("main.OpenAIChatModel", return_value="live-client"),
+            patch("main.run_workflow", return_value={"status": "completed"}) as run,
+        ):
+            self.assertEqual(main.main(), 0)
+
+        load_dotenv.assert_called_once_with(override=True)
+        self.assertEqual(
+            run.call_args.kwargs["model_client"],
+            "live-client",
+        )
+
+    def test_read_observation_returns_to_model_before_final_answer(self):
+        model = ScriptedModel([
+            tool_step("get_calendar", {
+                "start_date": "2026-12-07",
+                "end_date": "2026-12-07",
+            }),
+            final_step("The calendar is clear."),
+        ])
+        graph = build_graph(model_client=model)
+        result = graph.invoke(
+            initial_state(),
+            config={"configurable": {"thread_id": "read-then-answer"}},
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result"], "The calendar is clear.")
+        self.assertEqual(result["model_turns"], 2)
+        self.assertEqual(result["tool_calls"], 1)
+        self.assertEqual(
+            [entry["type"] for entry in result["trajectory"]],
+            ["user_request", "model_response", "tool_observation", "model_response"],
+        )
+        self.assertEqual(result["messages"][-2]["role"], "tool")
+
+    def test_write_without_successful_read_is_rejected_without_approval(self):
+        model = ScriptedModel([
+            tool_step("create_event", create_args()),
+            final_step("Read calendar availability before a write."),
+        ])
+        graph = build_graph(model_client=model)
+        result = graph.invoke(
+            initial_state(),
+            config={"configurable": {"thread_id": "write-needs-read"}},
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(store.load()["events"]), 8)
+        observation = result["trajectory"][2]["observation"]
+        self.assertEqual(observation["error"]["code"], "availability_check_required")
+        self.assertEqual(result["approval_decisions"], [])
+
+    def test_approved_write_runs_only_after_read_and_human_confirmation(self):
+        model = ScriptedModel([
+            tool_step("find_free_slots", {
+                "start_date": "2026-12-07",
+                "end_date": "2026-12-07",
+                "duration_minutes": 30,
+            }),
+            tool_step("create_event", create_args()),
+            final_step("Created the sandbox event."),
+        ])
+        graph = build_graph(model_client=model)
+        config = {"configurable": {"thread_id": "approved-write"}}
+        result = graph.invoke(initial_state("approved-write"), config=config)
+        approval = result["__interrupt__"][0].value
+        self.assertEqual(approval["type"], "approval")
+        self.assertEqual(approval["proposal"]["title"], "Project meeting")
+        self.assertEqual(approval["proposal"]["attendees"], ["sam@example.com"])
+        self.assertEqual(len(store.load()["events"]), 8)
+
+        result = graph.invoke(Command(resume={"decision": "yes"}), config=config)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["approval_decisions"], ["yes"])
+        self.assertEqual(len(store.load()["events"]), 9)
+        self.assertEqual(store.load()["outbox"][0]["to"], "sam@example.com")
+        self.assertEqual(result["trajectory"][-2]["type"], "write_result")
+
+    def test_rejection_does_not_create_event(self):
+        model = ScriptedModel([
+            tool_step("get_calendar", {
+                "start_date": "2026-12-07",
+                "end_date": "2026-12-07",
+            }),
+            tool_step("create_event", create_args()),
+            final_step("No event was created."),
+        ])
+        graph = build_graph(model_client=model)
+        config = {"configurable": {"thread_id": "rejected-write"}}
+        graph.invoke(initial_state("rejected-write"), config=config)
+        result = graph.invoke(Command(resume="no"), config=config)
+
+        self.assertEqual(result["approval_decisions"], ["no"])
+        self.assertEqual(len(store.load()["events"]), 8)
+        self.assertEqual(result["trajectory"][-2]["type"], "approval_result")
+
+    def test_edit_changes_operation_and_requires_a_new_approval(self):
+        model = ScriptedModel([
+            tool_step("get_calendar", {
+                "start_date": "2026-12-07",
+                "end_date": "2026-12-07",
+            }),
+            tool_step("create_event", create_args()),
+            final_step("The edited event was created."),
+        ])
+        graph = build_graph(model_client=model)
+        config = {"configurable": {"thread_id": "edit-write"}}
+        graph.invoke(initial_state("edit-write"), config=config)
+        edit_result = graph.invoke(
+            Command(resume={"decision": "edit"}), config=config
+        )
+        edit_request = edit_result["__interrupt__"][0].value
         self.assertEqual(edit_request["type"], "edit")
 
-        updated_event = event("Updated project meeting", "Updated plan")
-        result = graph.invoke(Command(resume=updated_event), config=config)
-        approval_request = interrupted_request(result)
-        self.assertEqual(approval_request["type"], "approval")
-        self.assertEqual(approval_request["proposal"]["title"], "Updated project meeting")
-        self.assertEqual(approval_request["proposal"]["description"], "Updated plan")
+        edited = {
+            "title": "Updated project meeting",
+            "start": "2026-12-08T14:00",
+            "end": "2026-12-08T14:30",
+            "attendees": ["sam@example.com"],
+            "description": "Updated plan",
+        }
+        approval_result = graph.invoke(Command(resume=edited), config=config)
+        next_approval = approval_result["__interrupt__"][0].value
+        self.assertEqual(next_approval["type"], "approval")
+        self.assertEqual(next_approval["proposal"]["title"], edited["title"])
+        self.assertEqual(len(store.load()["events"]), 8)
 
-        with patch(
-            "agent.nodes.execute_approved",
-            return_value=json.dumps({"ok": True, "created": True}),
-        ) as execute_approved:
-            result = graph.invoke(Command(resume="yes"), config=config)
+        result = graph.invoke(Command(resume="yes"), config=config)
+        self.assertEqual(result["approval_decisions"], ["edit", "yes"])
+        self.assertEqual(len(store.load()["events"]), 9)
+        self.assertEqual(store.load()["events"][-1]["description"], "Updated plan")
 
-        self.assertEqual(result["approval"], "completed")
-        operation = execute_approved.call_args.args[1]
-        self.assertEqual(operation["title"], "Updated project meeting")
-        self.assertEqual(operation["description"], "Updated plan")
-        self.assertEqual(operation["idempotency_key"], prepare_sandbox_event(
-            updated_event, "workflow-test"
-        )["idempotency_key"])
-
-    def test_declining_never_executes_the_write_tool(self):
-        graph = build_graph()
-        config = {"configurable": {"thread_id": "decline-test"}}
-        result = graph.invoke(
-            {
-                "event": event(),
-                "approval": "pending",
-                "request_id": "decline-test",
-            },
-            config=config,
+    def test_model_tool_schema_hides_system_managed_idempotency_key(self):
+        model_schema = next(
+            spec["function"]["parameters"]
+            for spec in openai_specs()
+            if spec["function"]["name"] == "create_event"
         )
+        self.assertNotIn("idempotency_key", model_schema["properties"])
+        self.assertNotIn("idempotency_key", model_schema["required"])
+        self.assertNotIn("x-format-hint", str(model_schema))
+        self.assertIn("idempotency_key", CREATE_EVENT.parameters["properties"])
 
-        with patch("agent.nodes.execute_approved") as execute:
-            result = graph.invoke(Command(resume="no"), config=config)
-
-        self.assertEqual(result["approval"], "rejected")
-        execute.assert_not_called()
-
-    def test_sandbox_limits_do_not_leak_into_application_schema(self):
-        long_title = event("T" * 121)
-        self.assertEqual(len(EventPayload.model_validate(long_title).title), 121)
+    def test_application_schema_remains_separate_from_sandbox_limits(self):
+        payload = EventPayload(
+            title="T" * 121,
+            start_time="2026-12-03T14:00:00+01:00",
+            end_time="2026-12-03T15:00:00+01:00",
+            attendees=[f"user{i}@example.com" for i in range(21)],
+        ).model_dump(mode="json")
+        self.assertEqual(len(EventPayload.model_validate(payload).attendees), 21)
         with self.assertRaisesRegex(ValueError, "titles cannot exceed 120"):
-            prepare_sandbox_event(long_title, "long-title-test")
+            prepare_sandbox_event(payload, "sandbox-limit-test")
 
-        many_attendees = event()
-        many_attendees["attendees"] = [f"user{i}@example.com" for i in range(21)]
-        self.assertEqual(len(EventPayload.model_validate(many_attendees).attendees), 21)
-        with self.assertRaisesRegex(ValueError, "at most 20 attendees"):
-            prepare_sandbox_event(many_attendees, "many-attendees-test")
-
-    def test_sandbox_idempotency_requires_request_id(self):
-        with self.assertRaisesRegex(ValueError, "request ID is required"):
-            prepare_sandbox_event(event(), " ")
-
-        self.assertNotEqual(
-            prepare_sandbox_event(event(), "request-one")["idempotency_key"],
-            prepare_sandbox_event(event(), "request-two")["idempotency_key"],
+    def test_live_cost_is_computed_from_configured_token_rates(self):
+        settings = AgentSettings(
+            input_usd_per_1m_tokens=2.0,
+            output_usd_per_1m_tokens=8.0,
         )
+        self.assertAlmostEqual(settings.cost_for_tokens(1000, 500), 0.006)
+
+    def test_live_model_and_cost_ceiling_are_fixed(self):
+        with patch.dict(os.environ, {"OPENAI_MODEL": "another-model"}, clear=True):
+            settings = AgentSettings.from_env()
+        self.assertEqual(settings.model, "gpt-4o-mini")
+        self.assertEqual(settings.max_cost_usd, 0.10)
+        with self.assertRaisesRegex(ValueError, "fixed to gpt-4o-mini"):
+            AgentSettings(model="another-model")
+        with self.assertRaisesRegex(ValueError, "cannot exceed \\$0.10"):
+            AgentSettings(max_cost_usd=0.11)
+
+    def test_live_preflight_caps_output_tokens_to_remaining_budget(self):
+        class LiveSpyModel:
+            is_live = True
+
+            def __init__(self):
+                self.called_with = None
+
+            def complete(
+                self,
+                messages,
+                tools,
+                *,
+                model,
+                max_completion_tokens,
+                allow_tools,
+                timeout_seconds,
+            ):
+                self.called_with = {
+                    "model": model,
+                    "max_completion_tokens": max_completion_tokens,
+                    "allow_tools": allow_tools,
+                    "message_count": len(messages),
+                    "tool_count": len(tools),
+                    "timeout_seconds": timeout_seconds,
+                }
+                return ModelResponse(
+                    assistant_message={"role": "assistant", "content": "Done."},
+                    input_tokens=0,
+                    output_tokens=1,
+                    usage_source="test",
+                )
+
+        model = LiveSpyModel()
+        settings = AgentSettings(
+            max_cost_usd=0.0015,
+            input_usd_per_1m_tokens=0,
+            output_usd_per_1m_tokens=1000,
+        )
+        graph = build_graph(model_client=model, settings=settings)
+        result = graph.invoke(
+            initial_state(),
+            config={"configurable": {"thread_id": "live-budget-cap"}},
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(model.called_with["model"], "gpt-4o-mini")
+        self.assertEqual(model.called_with["max_completion_tokens"], 1)
+
+    def test_live_preflight_blocks_call_when_input_reserve_exceeds_budget(self):
+        class LiveSpyModel:
+            is_live = True
+
+            def __init__(self):
+                self.called = False
+
+            def complete(self, *args, **kwargs):
+                self.called = bool(args or kwargs)
+                raise AssertionError("Over-budget request reached the model client.")
+
+        model = LiveSpyModel()
+        settings = AgentSettings(
+            max_cost_usd=0.10,
+            input_usd_per_1m_tokens=1_000_000,
+            output_usd_per_1m_tokens=1000,
+        )
+        graph = build_graph(model_client=model, settings=settings)
+        result = graph.invoke(
+            initial_state(),
+            config={"configurable": {"thread_id": "live-budget-block"}},
+        )
+
+        self.assertEqual(result["status"], "limit_reached")
+        self.assertEqual(result["stop_reason"], "cost_limit")
+        self.assertFalse(model.called)
+
+    def test_model_timeout_stops_without_executing_a_tool(self):
+        class TimeoutModel:
+            is_live = False
+
+            def complete(self, *args, **kwargs):
+                if not args or not kwargs:
+                    raise AssertionError("Graph did not pass the model request.")
+                raise TimeoutError("timed out")
+
+        graph = build_graph(model_client=TimeoutModel())
+        result = graph.invoke(
+            initial_state(),
+            config={"configurable": {"thread_id": "model-timeout"}},
+        )
+
+        self.assertEqual(result["status"], "limit_reached")
+        self.assertEqual(result["stop_reason"], "timeout")
+        self.assertEqual(len(store.load()["events"]), 8)
 
 
 if __name__ == "__main__":

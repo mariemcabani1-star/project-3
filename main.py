@@ -1,155 +1,146 @@
-
-from dotenv import load_dotenv
-
-# Load configuration before importing LangSmith or the graph.
-load_dotenv()
-
+import argparse
+import time
 import uuid
 
-from langsmith import traceable
+from dotenv import load_dotenv
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
+from langsmith import traceable
 
+from agent.config import AgentSettings
 from agent.graph import build_graph
-from schemas.event_schema import EventPayload
+from agent.model import ModelClient, OpenAIChatModel
+from agent.nodes import SYSTEM_PROMPT
 
-def display_event(event):
-    print("\n========== EVENT PROPOSAL ==========")
-    print("Title:", event["title"])
-    print("Start:", event["start_time"])
-    print("End:", event["end_time"])
-    print("Attendees:", event.get("attendees", []))
-    print("Description:", event.get("description", ""))
-    print("====================================")
 
-def collect_initial_event():
-    print("\n========== CREATE EVENT ==========")
+def collect_user_request() -> str:
+    request = input("What would you like to schedule? ").strip()
+    if not request:
+        raise ValueError("Please enter a calendar request.")
+    return request
 
-    title = input("Event title: ").strip()
-    start = input(
-        "Start time (example: 2026-11-16T14:00:00+01:00): "
-    ).strip()
-    end = input(
-        "End time (example: 2026-11-16T14:30:00+01:00): "
-    ).strip()
 
-    description = input("Description (optional): ").strip()
+def display_proposal(proposal: dict) -> None:
+    print("\nProposed sandbox calendar operation")
+    print(f"Title: {proposal.get('title', '(missing)')}")
+    print(f"Start: {proposal.get('start_time', '(missing)')}")
+    print(f"End: {proposal.get('end_time', '(missing)')}")
+    attendees = proposal.get("attendees", [])
+    print(f"Attendees: {', '.join(attendees) if attendees else 'None'}")
+    if proposal.get("description"):
+        print(f"Description: {proposal['description']}")
 
-    attendee_input = input(
-        "Attendee emails separated by commas (or press Enter): "
-    ).strip()
 
-    attendees = [
-        email.strip()
-        for email in attendee_input.split(",")
-        if email.strip()
-    ]
-
-    event = EventPayload(
-        title=title,
-        start_time=start,
-        end_time=end,
-        attendees=attendees,
-        description=description
-    )
-
-    return event.model_dump(mode="json")
-
-def collect_edited_event(current_event):
-    print("\n========== EDIT EVENT ==========")
-    print("Enter the complete corrected event details.")
-
-    title = input(
-        f"New title [{current_event['title']}]: "
-    ).strip() or current_event["title"]
-
-    start = input(
-        f"New start [{current_event['start_time']}]: "
-    ).strip() or current_event["start_time"]
-
-    end = input(
-        f"New end [{current_event['end_time']}]: "
-    ).strip() or current_event["end_time"]
-
+def collect_edited_tool_args(proposal: dict) -> dict:
+    print("\nEnter the corrected event details. Press Enter to keep a value.")
+    title = input(f"Title [{proposal.get('title', '')}]: ").strip()
+    start = input(f"Start [{proposal.get('start', '')}]: ").strip()
+    end = input(f"End [{proposal.get('end', '')}]: ").strip()
+    current_attendees = ", ".join(proposal.get("attendees", []))
+    attendees = input(f"Attendees, comma-separated [{current_attendees}]: ").strip()
     description = input(
-        "New description (press Enter to keep current): "
-    ).strip() or current_event.get("description", "")
+        f"Description [{proposal.get('description', '')}]: "
+    ).strip()
+    return {
+        "title": title or proposal.get("title", ""),
+        "start": start or proposal.get("start", ""),
+        "end": end or proposal.get("end", ""),
+        "attendees": (
+            [item.strip() for item in attendees.split(",") if item.strip()]
+            if attendees
+            else proposal.get("attendees", [])
+        ),
+        "description": description or proposal.get("description", ""),
+    }
 
-    # Keep the original attendee list unless a separate,
-    # explicitly approved attendee-edit feature is implemented.
-    edited = EventPayload(
-        title=title,
-        start_time=start,
-        end_time=end,
-        attendees=current_event.get("attendees", []),
-        description=description
-    )
 
-    return edited.model_dump(mode="json")
-
-@traceable(name="Calendar Agent Workflow")
-def run_workflow(event):
-
-    graph = build_graph()
-
-    # Each run gets a unique conversation/checkpoint ID.
+@traceable(name="langgraph-calendar-agent")
+def run_workflow(
+    user_request: str,
+    *,
+    model_client: ModelClient,
+    settings: AgentSettings | None = None,
+) -> dict:
+    runtime_settings = settings or AgentSettings.from_env()
+    graph = build_graph(model_client=model_client, settings=runtime_settings)
     thread_id = str(uuid.uuid4())
-    config = {
-        "configurable": {
-            "thread_id": thread_id
-        }
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": (
+            runtime_settings.max_model_turns
+            + 5 * runtime_settings.max_tool_calls
+            + 10
+        ),
     }
     initial_state = {
-        "event": event,
-        "approval": "pending",
         "request_id": thread_id,
+        "user_request": user_request,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_request},
+        ],
+        "pending_tool_call": None,
+        "approved_tool_call": None,
+        "approval": "pending",
+        "approval_decisions": [],
+        "successful_reads": 0,
+        "model_turns": 0,
+        "tool_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "started_at": time.monotonic(),
+        "trajectory": [{"type": "user_request", "text": user_request}],
+        "status": "running",
     }
 
-    result = graph.invoke(
-        initial_state,
-        config=config,
-    )
-
+    result = graph.invoke(initial_state, config=config)
     while result.get("__interrupt__"):
+        interrupt_value = result["__interrupt__"][0].value
+        interrupt_type = interrupt_value.get("type")
+        if interrupt_type == "approval":
+            display_proposal(interrupt_value["proposal"])
+            print("1) Yes  2) No  3) Edit")
+            choice = input("Choose an option (1/2/3): ").strip()
+            decision = {"1": "yes", "2": "no", "3": "edit"}.get(choice, "no")
+            resume_value = {"decision": decision}
+        elif interrupt_type == "edit":
+            resume_value = collect_edited_tool_args(interrupt_value["proposal"])
+        else:
+            raise RuntimeError(f"Unknown graph interrupt type: {interrupt_type!r}")
+        result = graph.invoke(Command(resume=resume_value), config=config)
 
-        interruption = result["__interrupt__"][0]
-        request = interruption.value
+    print(f"\nResult: {result.get('result', 'No result was produced.')}")
+    print(
+        "Usage: "
+        f"{result.get('model_turns', 0)} model turns, "
+        f"{result.get('tool_calls', 0)} tool calls, "
+        f"{result.get('input_tokens', 0)} input tokens, "
+        f"{result.get('output_tokens', 0)} output tokens, "
+        f"estimated ${result.get('estimated_cost_usd', 0.0):.6f}"
+    )
+    return result
 
-        if request["type"] == "approval":
 
-            display_event(request["proposal"])
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run the live sandbox calendar agent.")
+    parser.add_argument(
+        "--mode",
+        choices=("live",),
+        required=True,
+        help="Live mode sends requests to OpenAI and requires API credits.",
+    )
+    parser.parse_args()
+    load_dotenv(override=True)
+    try:
+        result = run_workflow(
+            collect_user_request(),
+            model_client=OpenAIChatModel(),
+        )
+    except (ValueError, RuntimeError) as error:
+        parser.exit(2, f"error: {error}\n")
+    return 0 if result.get("status") == "completed" else 1
 
-            decision = input(
-                "\nApprove this event? (yes/no/edit): "
-            ).strip().lower()
-
-            if decision not in ("yes", "no", "edit"):
-                print("Invalid choice. Treating it as No.")
-                decision = "no"
-
-            result = graph.invoke(
-                Command(resume=decision),
-                config=config,
-            )
-
-        elif request["type"] == "edit":
-
-            edited_event = collect_edited_event(
-                request["current_event"]
-            )
-
-            result = graph.invoke(
-                Command(resume=edited_event),
-                config=config
-            )
-
-    print("\n========== WORKFLOW RESULT ==========")
-    print(result.get("result", "No result returned."))
 
 if __name__ == "__main__":
-
-    try:
-        event = collect_initial_event()
-        run_workflow(event)
-
-    except Exception as error:
-        print("\nERROR:", error)
+    raise SystemExit(main())

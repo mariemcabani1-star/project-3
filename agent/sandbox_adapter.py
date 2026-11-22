@@ -80,3 +80,42 @@ def prepare_sandbox_event(event: dict, request_id: str) -> dict:
         "description": payload.description,
         "idempotency_key": idempotency_key,
     }
+
+
+def prepare_model_create_event(arguments: dict, request_id: str) -> dict:
+    """Add the request-scoped idempotency key to model-supplied tool arguments."""
+    if not request_id.strip():
+        raise ValueError("A request ID is required for sandbox idempotency.")
+    if not isinstance(arguments, dict):
+        raise ValueError("Event arguments must be a JSON object.")
+    if "idempotency_key" in arguments:
+        raise ValueError("The idempotency key is system-managed and cannot be supplied by the model.")
+
+    attendees = arguments.get("attendees", [])
+    if not isinstance(attendees, list) or any(
+        not isinstance(attendee, str) for attendee in attendees
+    ):
+        raise ValueError("Attendees must be a list of email addresses.")
+    description = arguments.get("description", "")
+    if not isinstance(description, str):
+        raise ValueError("Description must be text.")
+
+    operation = {
+        **arguments,
+        "attendees": attendees,
+        "description": description,
+    }
+    identity = {
+        "request_id": request_id,
+        "title": operation.get("title"),
+        "start": operation.get("start"),
+        "end": operation.get("end"),
+        "attendees": sorted(a.lower() for a in operation["attendees"]),
+    }
+    if operation["description"]:
+        identity["description"] = operation["description"]
+
+    operation["idempotency_key"] = hashlib.sha256(
+        json.dumps(identity, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:32]
+    return operation

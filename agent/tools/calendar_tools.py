@@ -178,7 +178,7 @@ def create_event(args: dict) -> dict:
         state["outbox"].append({"to": who, "event_id": event_id, "type": "invite"})
     state["idempotency"][key] = {"fingerprint": fp, "event_id": event_id}
     store.save(state)
-    return {"created": True, "event": _public(ev), "invites_sent": len(attendees)}
+    return {"created": True, "event": _public(ev), "invites_queued": len(attendees)}
 
 
 # ---------- tool definitions ----------
@@ -228,9 +228,9 @@ FIND_FREE_SLOTS = Tool(
 
 CREATE_EVENT = Tool(
     name="create_event",
-    description=("WRITE. Create a calendar event and send invites to attendees. Requires human approval. "
-                 "Fails if the time overlaps another event. Generate one unique idempotency_key per "
-                 "intended event and reuse the SAME key if you retry."),
+    description=("WRITE. Create a calendar event and queue attendee invitations in the sandbox outbox; "
+                 "no real invitations are sent. Requires human approval. Fails if the time overlaps "
+                 "another event. The system manages the idempotency key."),
     parameters={
         "type": "object",
         "properties": {
