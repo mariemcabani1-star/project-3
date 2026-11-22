@@ -72,6 +72,13 @@ def _public(ev: dict) -> dict:
     return public_event
 
 
+def get_event_by_id(event_id: str) -> dict | None:
+    return next(
+        (event for event in store.load()["events"] if event["id"] == event_id),
+        None,
+    )
+
+
 # ---------- read tool 1 ----------
 def get_calendar(args: dict) -> dict:
     a, b = _range(args["start_date"], args["end_date"])
@@ -131,7 +138,7 @@ def _fingerprint(args: dict) -> str:
 
 
 def create_event(args: dict) -> dict:
-    """WRITE. Creates an event in the sandbox and 'sends' invites to the sandbox outbox.
+    """WRITE. Creates an event in the sandbox. It does not queue or send invites.
 
     Idempotent: the same idempotency_key + same arguments returns the original event
     instead of creating a second one. Same key with different arguments is an error.
@@ -174,11 +181,67 @@ def create_event(args: dict) -> dict:
           "end": args["end"], "attendees": attendees,
           "description": args.get("description", "")}
     state["events"].append(ev)
-    for who in attendees:
-        state["outbox"].append({"to": who, "event_id": event_id, "type": "invite"})
     state["idempotency"][key] = {"fingerprint": fp, "event_id": event_id}
     store.save(state)
-    return {"created": True, "event": _public(ev), "invites_queued": len(attendees)}
+    return {"created": True, "event": _public(ev)}
+
+
+def validate_send_invite(args: dict) -> dict:
+    event = get_event_by_id(args["event_id"])
+    if event is None:
+        raise ToolError(
+            "event_not_found",
+            f"No sandbox event exists with id '{args['event_id']}'.",
+            "Read the sandbox calendar and use an existing event ID.",
+        )
+
+    event_attendees = {attendee.lower() for attendee in event.get("attendees", [])}
+    requested = {attendee.lower() for attendee in args["attendees"]}
+    if not requested.issubset(event_attendees):
+        raise ToolError(
+            "attendee_not_on_event",
+            "Every invite recipient must already be listed on the approved sandbox event.",
+            "Use only attendees included when the event was created.",
+        )
+    return event
+
+
+def send_invite(args: dict) -> dict:
+    """WRITE. Queue invitations in the JSON outbox; never contacts an email service."""
+    validate_send_invite(args)
+    state = store.load()
+    event_id = args["event_id"]
+    recipients = list(dict.fromkeys(
+        attendee.strip().lower() for attendee in args["attendees"]
+    ))
+    queued_recipients = {
+        entry["to"].lower()
+        for entry in state["outbox"]
+        if entry.get("event_id") == event_id and entry.get("type") == "invite"
+    }
+
+    newly_queued = []
+    already_queued = []
+    for recipient in recipients:
+        if recipient in queued_recipients:
+            already_queued.append(recipient)
+            continue
+        state["outbox"].append({
+            "to": recipient,
+            "event_id": event_id,
+            "type": "invite",
+        })
+        newly_queued.append(recipient)
+
+    if newly_queued:
+        store.save(state)
+    return {
+        "queued": len(newly_queued),
+        "already_queued": len(already_queued),
+        "recipients": recipients,
+        "delivery": "sandbox_outbox_only",
+        "note": "Invitations were queued locally; no email was sent.",
+    }
 
 
 # ---------- tool definitions ----------
@@ -228,9 +291,10 @@ FIND_FREE_SLOTS = Tool(
 
 CREATE_EVENT = Tool(
     name="create_event",
-    description=("WRITE. Create a calendar event and queue attendee invitations in the sandbox outbox; "
-                 "no real invitations are sent. Requires human approval. Fails if the time overlaps "
-                 "another event. The system manages the idempotency key."),
+    description=("WRITE. Create a calendar event in the isolated JSON sandbox. "
+                 "Requires human approval and fails if the time overlaps another event. "
+                 "This does not queue or send invitations; use send_invite for that. "
+                 "The system manages the idempotency key."),
     parameters={
         "type": "object",
         "properties": {
@@ -250,5 +314,37 @@ CREATE_EVENT = Tool(
         "additionalProperties": False,
     },
     fn=create_event,
+    writes=True,
+)
+
+SEND_INVITE = Tool(
+    name="send_invite",
+    description=("WRITE. Queue invitations for attendees already listed on an existing "
+                 "sandbox event. Requires human approval. This only appends to the local "
+                 "JSON outbox; it never sends email. Repeated calls do not queue duplicates."),
+    parameters={
+        "type": "object",
+        "properties": {
+            "event_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": r"[A-Za-z0-9_-]{1,64}",
+            },
+            "attendees": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                    "type": "string",
+                    "pattern": EMAIL_PATTERN,
+                    "x-format-hint": "a valid email address",
+                },
+            },
+        },
+        "required": ["event_id", "attendees"],
+        "additionalProperties": False,
+    },
+    fn=send_invite,
     writes=True,
 )

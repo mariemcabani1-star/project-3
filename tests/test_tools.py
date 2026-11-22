@@ -87,12 +87,12 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(r["error"]["code"], "range_too_large")
 
     # --- write tool ---
-    def test_create_event_writes_and_queues_invites(self):
+    def test_create_event_writes_without_queuing_invites(self):
         r = call("create_event", **new_event())
         self.assertTrue(r["created"])
         s = store.load()
         self.assertEqual(len(s["events"]), 9)
-        self.assertEqual(s["outbox"][0]["to"], "a@example.com")
+        self.assertEqual(s["outbox"], [])
 
     def test_registry_blocks_direct_write_without_approval(self):
         result = json.loads(execute("create_event", new_event()))
@@ -131,7 +131,63 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(r2["already_existed"])
         s = store.load()
         self.assertEqual(len(s["events"]), 9)   # not 10
-        self.assertEqual(len(s["outbox"]), 1)   # invite not sent twice
+        self.assertEqual(s["outbox"], [])
+
+    def test_send_invite_queues_only_in_sandbox_outbox(self):
+        created = call("create_event", **new_event())
+        result = call(
+            "send_invite",
+            event_id=created["event"]["id"],
+            attendees=["a@example.com"],
+        )
+
+        self.assertEqual(result["queued"], 1)
+        self.assertEqual(result["delivery"], "sandbox_outbox_only")
+        self.assertEqual(
+            store.load()["outbox"],
+            [{
+                "to": "a@example.com",
+                "event_id": created["event"]["id"],
+                "type": "invite",
+            }],
+        )
+
+    def test_send_invite_is_idempotent(self):
+        created = call("create_event", **new_event())
+        args = {
+            "event_id": created["event"]["id"],
+            "attendees": ["a@example.com"],
+        }
+
+        first = call("send_invite", **args)
+        second = call("send_invite", **args)
+
+        self.assertEqual(first["queued"], 1)
+        self.assertEqual(second["queued"], 0)
+        self.assertEqual(second["already_queued"], 1)
+        self.assertEqual(len(store.load()["outbox"]), 1)
+
+    def test_send_invite_rejects_recipients_not_on_event(self):
+        error = precheck(
+            "send_invite",
+            {"event_id": "evt_0001", "attendees": ["attacker@example.com"]},
+        )
+
+        self.assertIsNotNone(error)
+        self.assertEqual(
+            json.loads(error)["error"]["code"],
+            "attendee_not_on_event",
+        )
+        self.assertEqual(store.load()["outbox"], [])
+
+    def test_send_invite_cannot_run_without_approval(self):
+        result = json.loads(execute(
+            "send_invite",
+            {"event_id": "evt_0001", "attendees": ["attacker@example.com"]},
+        ))
+
+        self.assertEqual(result["error"]["code"], "approval_required")
+        self.assertEqual(store.load()["outbox"], [])
 
     def test_description_is_part_of_idempotency_fingerprint(self):
         call("create_event", **new_event(description="Original description"))
@@ -163,16 +219,29 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(len(store.load()["events"]), 8)
 
     # --- loop helpers ---
-    def test_only_write_tool_needs_approval(self):
+    def test_all_write_tools_need_approval(self):
         self.assertTrue(needs_approval("create_event"))
+        self.assertTrue(needs_approval("send_invite"))
         self.assertFalse(needs_approval("get_calendar"))
         self.assertFalse(needs_approval("find_free_slots"))
         self.assertIn("Create event", describe_call("create_event", new_event()))
+        self.assertIn(
+            "Queue sandbox invitations",
+            describe_call(
+                "send_invite",
+                {"event_id": "evt_0001", "attendees": ["team@example.com"]},
+            ),
+        )
 
     def test_openai_specs(self):
         specs = openai_specs()
         self.assertEqual({s["function"]["name"] for s in specs},
-                         {"get_calendar", "find_free_slots", "create_event"})
+                         {
+                             "get_calendar",
+                             "find_free_slots",
+                             "create_event",
+                             "send_invite",
+                         })
 
     def test_calls_are_logged(self):
         call("get_calendar", start_date="2026-12-01", end_date="2026-12-01")

@@ -18,10 +18,21 @@ from pathlib import Path
 from typing import Any
 
 from .base import Tool, ToolError
-from .calendar_tools import CREATE_EVENT, FIND_FREE_SLOTS, GET_CALENDAR
+from .calendar_tools import (
+    CREATE_EVENT,
+    FIND_FREE_SLOTS,
+    GET_CALENDAR,
+    SEND_INVITE,
+    validate_send_invite,
+)
 from .validation import validate
 
-ALL_TOOLS: list[Tool] = [GET_CALENDAR, FIND_FREE_SLOTS, CREATE_EVENT]
+ALL_TOOLS: list[Tool] = [
+    GET_CALENDAR,
+    FIND_FREE_SLOTS,
+    CREATE_EVENT,
+    SEND_INVITE,
+]
 TOOLS: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 _APPROVAL_ISSUER = object()
 
@@ -85,6 +96,9 @@ def describe_call(name: str, args: dict) -> str:
         who = ", ".join(args.get("attendees", [])) or "nobody"
         return (f"Create event '{args.get('title')}' from {args.get('start')} to "
                 f"{args.get('end')}, invite: {who}")
+    if name == "send_invite":
+        who = ", ".join(args.get("attendees", [])) or "nobody"
+        return f"Queue sandbox invitations for event {args.get('event_id')} to: {who}"
     return f"Call {name} with {json.dumps(args)}"
 
 
@@ -206,6 +220,8 @@ def precheck(name: str, raw_args) -> str | None:
         if problems:
             raise ToolError("bad_arguments", "; ".join(problems),
                             "Fix the arguments and call the tool again.")
+        if name == "send_invite":
+            validate_send_invite(args)
     except ToolError as e:
         result = {
             "ok": False,

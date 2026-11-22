@@ -10,6 +10,31 @@ call Google Calendar. Invitations are queued in the sandbox outbox, not sent.
 
 ## Execution modes
 
+### Interactive offline demo (no API key or API calls)
+
+```powershell
+python main.py --mode offline
+```
+
+The CLI asks what you want to add, then collects the event title, date, time,
+attendees, and description. A deterministic scripted planner—not an LLM—then
+uses the real LangGraph workflow to read the JSON sandbox, show the proposed
+write, and wait for **Yes**, **No**, or **Edit**. If approved, it creates the
+event in the sandbox. If attendees were entered, it then shows a separate
+invitation proposal and requires another approval before adding those recipients
+to the sandbox outbox. It never sends real invitations. This mode does not load
+`.env`, call OpenAI, or incur API charges. It demonstrates orchestration and
+safety behavior, not live model reasoning or natural-language understanding.
+It also bypasses LangSmith tracing, so offline mode makes no external service
+calls.
+
+The demo writes to `sandbox/state.json`; reset the sandbox before another clean
+demo if needed:
+
+```powershell
+python -m sandbox.reset
+```
+
 ### Offline evaluation (no API key or API calls)
 
 ```powershell
@@ -45,8 +70,9 @@ remaining`. This indicates that the billing project or organization for the
 active key has no available API credits; it is not a LangGraph or sandbox
 failure. Live requests require a funded OpenAI project.
 
-If you do not have credits, use offline evaluation instead. It uses scripted
-model clients and does not load `.env`, import the OpenAI SDK, or make API
+If you do not have credits, the interactive offline demo is available with
+`python main.py --mode offline`. For automated evaluation, use the scripted
+commands below; they do not load `.env`, import the OpenAI SDK, or make API
 requests:
 
 ```powershell
@@ -103,12 +129,15 @@ application-side limit, not a provider-guaranteed billing ceiling.
 | `sandbox/` | Isolated JSON calendar, seed data, reset, and invitation outbox |
 | `schemas/` | Application-level event validation |
 
-The model-facing tool set contains `get_calendar`, `find_free_slots`, and
-`create_event`. At least one successful calendar read is required before an
-event write can be presented for approval. The registry rejects direct writes,
-and the graph's one-use approval grant is bound to the exact operation. Future
-write tools must also be routed through an explicit approval checkpoint; the
-current approval form fails closed for unsupported write operations.
+The model-facing tool set contains `get_calendar`, `find_free_slots`,
+`create_event`, and `send_invite`. At least one successful calendar read is
+required before a write can be presented for approval. Event creation and
+invitation queueing are separate writes, each requiring explicit approval.
+`send_invite` only appends an invitation record to the sandbox JSON outbox,
+checks that recipients are listed on the event, and is idempotent; it never
+contacts an email service. The registry rejects direct writes, and the graph's
+one-use approval grant is bound to the exact operation. Unsupported write tools
+fail closed unless an explicit approval workflow is added.
 
 Tool observations are treated as untrusted input. The prompt-injection
 scenarios test that even an attempted write still requires human approval;
