@@ -1,7 +1,5 @@
 # Calendar sandbox and LangGraph fixes
 
-## Proposed commit message
-
 ```text
 feat: enforce sandboxed LangGraph calendar writes
 
