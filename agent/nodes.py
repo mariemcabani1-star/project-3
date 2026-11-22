@@ -5,7 +5,7 @@ from langgraph.types import interrupt
 
 from schemas.event_schema import EventPayload
 from agent.sandbox_adapter import prepare_sandbox_event
-from agent.tools.registry import execute
+from agent.tools.registry import _issue_write_approval, execute_approved
 
 
 def approval_node(state):
@@ -105,7 +105,8 @@ def create_event_node(state):
             "Event creation blocked: no approved operation was recorded."
         )
 
-    raw_result = execute("create_event", operation)
+    approval = _issue_write_approval("create_event", operation)
+    raw_result = execute_approved("create_event", operation, approval)
     result = json.loads(raw_result)
 
     if not result.get("ok"):

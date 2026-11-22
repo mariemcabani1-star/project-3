@@ -87,13 +87,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(approval_request["proposal"]["description"], "Updated plan")
 
         with patch(
-            "agent.nodes.execute",
+            "agent.nodes.execute_approved",
             return_value=json.dumps({"ok": True, "created": True}),
-        ) as execute:
+        ) as execute_approved:
             result = graph.invoke(Command(resume="yes"), config=config)
 
         self.assertEqual(result["approval"], "completed")
-        operation = execute.call_args.args[1]
+        operation = execute_approved.call_args.args[1]
         self.assertEqual(operation["title"], "Updated project meeting")
         self.assertEqual(operation["description"], "Updated plan")
         self.assertEqual(operation["idempotency_key"], prepare_sandbox_event(
@@ -112,7 +112,7 @@ class WorkflowTests(unittest.TestCase):
             config=config,
         )
 
-        with patch("agent.nodes.execute") as execute:
+        with patch("agent.nodes.execute_approved") as execute:
             result = graph.invoke(Command(resume="no"), config=config)
 
         self.assertEqual(result["approval"], "rejected")

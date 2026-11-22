@@ -3,8 +3,8 @@
 `execute()` NEVER raises: every outcome is a JSON string the model can read.
 Every call (input, output, duration) is appended to a JSONL log.
 
-The registry does not enforce the human checkpoint itself; it exposes
-`needs_approval()` and `describe_call()` so the agent loop can gate writes.
+Writes require a one-use approval grant bound to the exact tool arguments.
+The LangGraph creation node issues that grant only after its approval route.
 """
 from __future__ import annotations
 
@@ -21,6 +21,28 @@ from .validation import validate
 
 ALL_TOOLS: list[Tool] = [GET_CALENDAR, FIND_FREE_SLOTS, CREATE_EVENT]
 TOOLS: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
+_APPROVAL_ISSUER = object()
+
+
+class _WriteApproval:
+    __slots__ = ("tool_name", "arguments", "_used")
+
+    def __init__(self, tool_name: str, arguments: str, issuer: object):
+        if issuer is not _APPROVAL_ISSUER:
+            raise PermissionError("Write approval grants cannot be constructed directly.")
+        self.tool_name = tool_name
+        self.arguments = arguments
+        self._used = False
+
+    def consume(self, tool_name: str, args: dict) -> None:
+        if self._used:
+            raise ToolError("approval_reused", "This write approval has already been used.")
+        self._used = True
+        if self.tool_name != tool_name or self.arguments != _canonical(args):
+            raise ToolError(
+                "approval_mismatch",
+                "The write arguments do not match the operation approved by the user.",
+            )
 
 
 def log_path() -> Path:
@@ -57,8 +79,40 @@ def _parse(raw) -> dict:
     return val
 
 
+def _canonical(args: dict) -> str:
+    return json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _issue_write_approval(name: str, raw_args) -> _WriteApproval:
+    """Create an internal one-use grant for an operation after graph approval."""
+    tool = TOOLS.get(name)
+    if tool is None:
+        raise ToolError("unknown_tool", f"No tool named '{name}'.",
+                        f"Available tools: {sorted(TOOLS)}.")
+    if not tool.writes:
+        raise ToolError("approval_not_required", f"Tool '{name}' is not a write tool.")
+
+    args = _parse(raw_args)
+    problems = validate(args, tool.parameters)
+    if problems:
+        raise ToolError("bad_arguments", "; ".join(problems),
+                        "Fix the arguments and request approval again.")
+
+    return _WriteApproval(name, _canonical(args), _APPROVAL_ISSUER)
+
+
 def execute(name: str, raw_args) -> str:
-    """Run a tool call; returns a JSON string: {"ok": true, ...} or {"ok": false, "error": {...}}."""
+    """Execute reads directly; writes return approval_required without a grant."""
+    return _execute(name, raw_args)
+
+
+def execute_approved(name: str, raw_args, approval: _WriteApproval) -> str:
+    """Execute a write with its matching, one-use approval grant."""
+    return _execute(name, raw_args, approval)
+
+
+def _execute(name: str, raw_args, approval: _WriteApproval | None = None) -> str:
+    """Run a tool call and return a JSON result without leaking stack traces."""
     t0 = time.perf_counter()
     args: object = raw_args
     try:
@@ -71,6 +125,18 @@ def execute(name: str, raw_args) -> str:
         if problems:
             raise ToolError("bad_arguments", "; ".join(problems),
                             "Fix the arguments and call the tool again.")
+        if tool.writes:
+            if approval is None:
+                raise ToolError(
+                    "approval_required",
+                    f"Write tool '{name}' cannot run without explicit human approval.",
+                    "Route the operation through the LangGraph approval checkpoint.",
+                )
+            if not isinstance(approval, _WriteApproval):
+                raise ToolError("approval_required", "A valid write approval grant is required.")
+            approval.consume(name, args)
+        elif approval is not None:
+            raise ToolError("approval_not_required", f"Tool '{name}' is not a write tool.")
         result = {"ok": True, **tool.fn(args)}
     except ToolError as e:
         result = {"ok": False, "error": {"code": e.code, "message": e.message, "hint": e.hint}}

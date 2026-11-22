@@ -29,24 +29,28 @@ for sandbox idempotency.
 | `sandbox/` | Isolated JSON calendar, seed data, and reset support |
 | `schemas/` | Application-level event validation |
 
-`create_event` is the only write tool in the current graph, and its graph path
-requires explicit approval. Any future write tool must be added behind its own
-approval checkpoint; `interrupt()` alone does not gate tools that bypass the
-graph.
+`create_event` is the only write tool in the current graph. The registry rejects
+direct write execution; the graph creation node supplies a one-use grant bound
+to the exact operation only after explicit approval. Any future write tool must
+also be routed through an approval checkpoint.
 
 Invitations are recorded in the sandbox JSON outbox. No real invitations or
 Google Calendar writes are made by this workflow.
 
 ## Sandbox and tests
 
-Reset the sandbox calendar to its seed data:
+Reset the local sandbox calendar to its seed data:
 
 ```powershell
 python -m sandbox.reset
 ```
 
-Run the unit tests:
+Run the evaluation suite (it resets a disposable sandbox before testing and
+does not touch live Google Calendar):
 
 ```powershell
-python -m unittest discover -s tests -t .
+python -m tests.run_evaluation
 ```
+
+The root-level Google integration scripts are manual and are not part of this
+evaluation command.

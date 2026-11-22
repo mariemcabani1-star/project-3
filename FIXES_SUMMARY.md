@@ -3,20 +3,17 @@
 ## Proposed commit message
 
 ```text
-feat: integrate isolated calendar sandbox with LangGraph HITL
+feat: enforce sandboxed LangGraph calendar writes
 
-- Add a sandbox adapter to convert EventPayload values into validated tool arguments.
-- Replace live Google Calendar creation in the workflow with sandbox registry execution.
-- Extend CalendarState with a request ID and the exact approved operation.
-- Keep application validation separate from sandbox-specific limits.
-- Add seed data and reset support for reproducible sandbox initialization.
-- Preserve LangGraph approval, rejection, edit, and re-approval behavior.
-- Use the LangGraph thread ID as the request ID for idempotent creation.
-- Preserve descriptions through approval, storage, and idempotency checks.
-- Add workflow and sandbox tests for approval, edits, idempotency, and descriptions.
+- Route calendar creation through the isolated JSON sandbox, not Google Calendar.
+- Require a one-use registry grant bound to the exact operation approved in LangGraph.
+- Keep the thread ID as the request ID for idempotent creation.
+- Preserve descriptions and separate application validation from sandbox limits.
+- Reset a disposable seed calendar before evaluation and test the approval gates.
+- Preserve the yes/no/edit flow, including re-approval after edits.
 ```
 
-## Mistakes addressed
+## Implementation details
 
 - The CLI now displays the approval `proposal` payload.
 - The CLI creates one `thread_id`, uses it in the initial state as `request_id`,
@@ -24,13 +21,14 @@ feat: integrate isolated calendar sandbox with LangGraph HITL
 - Edited events return to the approval checkpoint before they can be created.
 - The graph executes the exact operation presented for approval.
 - Descriptions are retained in the proposed operation and sandbox event.
-- The adapter prepares sandbox operations; the creation node invokes the
-  registry only after the graph's explicit approval route.
+- The adapter prepares sandbox operations; the registry rejects direct writes
+  and accepts a one-use grant bound to the exact operation after graph approval.
 - The active LangGraph workflow does not import or call Google Calendar.
 
 ## Verification
 
-- `python -m unittest discover -s tests -t .` passed (28 tests).
+- `python -m tests.run_evaluation` passed (30 tests) using a disposable,
+  seed-reset sandbox.
 - An approved CLI event was created in a disposable sandbox; the event and
   invitation outbox entry were verified.
 
@@ -59,8 +57,8 @@ of scope for this step.
   user-proposed event rather than searching for an available time.
 - Sandbox invitations are queued in the JSON outbox; no real invitations are
   sent, and there is no separate `update_event` tool.
-- The approval gate applies to the LangGraph workflow path. Any future code
-  that calls the registry directly must enforce its own approval gate.
+- The registry rejects direct write calls. Any future write tool still needs a
+  graph approval route that issues a grant for its exact approved operation.
 - `tests/test_create_event.py` is empty. The root-level Google and LangSmith
   scripts are separate manual checks; they are not part of the documented
   unittest command.

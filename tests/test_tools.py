@@ -3,15 +3,23 @@ import os
 import tempfile
 import unittest
 
-_tmp = tempfile.mkdtemp()
+_evaluation_sandbox = os.environ.get("CALENDAR_AGENT_EVALUATION_SANDBOX")
+_tmp = _evaluation_sandbox or tempfile.mkdtemp()
 os.environ["CALENDAR_SANDBOX_DIR"] = _tmp
 os.environ["TOOL_LOG_PATH"] = os.path.join(_tmp, "calls.jsonl")
 
-from agent.tools import describe_call, execute, needs_approval, openai_specs  # noqa: E402
+from agent.tools import describe_call, execute, needs_approval, openai_specs, precheck  # noqa: E402
+from agent.tools.registry import _issue_write_approval, execute_approved  # noqa: E402
 from sandbox import store  # noqa: E402
 
 
 def call(name, **args):
+    if needs_approval(name):
+        error = precheck(name, args)
+        if error:
+            return json.loads(error)
+        approval = _issue_write_approval(name, args)
+        return json.loads(execute_approved(name, args, approval))
     return json.loads(execute(name, args))
 
 
@@ -85,6 +93,28 @@ class ToolTests(unittest.TestCase):
         s = store.load()
         self.assertEqual(len(s["events"]), 9)
         self.assertEqual(s["outbox"][0]["to"], "a@example.com")
+
+    def test_registry_blocks_direct_write_without_approval(self):
+        result = json.loads(execute("create_event", new_event()))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "approval_required")
+        self.assertEqual(len(store.load()["events"]), 8)
+
+    def test_approval_is_bound_to_exact_arguments_and_used_once(self):
+        args = new_event()
+        approval = _issue_write_approval("create_event", args)
+
+        mismatch = json.loads(execute_approved(
+            "create_event",
+            {**args, "title": "Different meeting"},
+            approval,
+        ))
+        self.assertEqual(mismatch["error"]["code"], "approval_mismatch")
+        self.assertEqual(len(store.load()["events"]), 8)
+
+        retry = json.loads(execute_approved("create_event", args, approval))
+        self.assertEqual(retry["error"]["code"], "approval_reused")
+        self.assertEqual(len(store.load()["events"]), 8)
 
     def test_description_is_stored_and_returned(self):
         r = call("create_event", **new_event(description="Discuss the launch plan"))
