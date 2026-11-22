@@ -1,0 +1,17 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+client_secret*.json
+
+# Local sandbox state and logs
+sandbox/state.json
+logs/
